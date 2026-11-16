@@ -169,6 +169,13 @@ impl App {
                 self.node_event(index, at, event);
             }
 
+            NodeInput::Stream(StreamInput::Unreadable(error)) => self.record(
+                now,
+                source,
+                Severity::Warn,
+                format!("{label} stream skipped an unreadable event: {error}"),
+            ),
+
             NodeInput::Inspect(StreamInput::Connected) => {
                 let node = &mut self.nodes[index];
                 if !matches!(node.inspect_connection, Connection::Connected { .. }) {
@@ -199,6 +206,16 @@ impl App {
 
             NodeInput::Inspect(StreamInput::Event(Stamped { at, event })) => {
                 self.inspect_event(index, at, event);
+            }
+
+            NodeInput::Inspect(StreamInput::Unreadable(error)) => {
+                self.nodes[index].seeded = false;
+                self.record(
+                    now,
+                    source,
+                    Severity::Warn,
+                    format!("{label} inspect stream skipped an unreadable event: {error}"),
+                );
             }
 
             // The poll fills only what the streams have not said: theirs is the newer.
@@ -293,6 +310,7 @@ impl App {
 
                     Some(_) if !resumed => {
                         node.seeded = false;
+                        node.replayed_through = node.recorded_through;
                         self.record(
                             at,
                             source,
@@ -309,6 +327,7 @@ impl App {
 
             InspectEvent::State(state) => {
                 let node = &mut self.nodes[index];
+                node.recorded(at);
                 let displayed = node.snapshot.as_ref().map(ClusterState::version);
                 match displayed {
                     // Older than what is shown: a duplicate, never a reverse transition.
@@ -343,11 +362,13 @@ impl App {
 
             InspectEvent::Settled(settlement) => {
                 let node = &mut self.nodes[index];
+                let replayed = node.replayed(at);
+                node.recorded(at);
                 let flipped = node
                     .settlement
                     .is_none_or(|previous| previous != settlement);
                 node.settlement = Some(settlement);
-                if flipped {
+                if flipped && !replayed {
                     self.record(
                         at,
                         source,
@@ -362,13 +383,18 @@ impl App {
             }
 
             InspectEvent::Gap { dropped } => {
-                self.nodes[index].seeded = false;
-                self.record(
-                    at,
-                    source,
-                    Severity::Warn,
-                    format!("{label} fell behind by {dropped} changes"),
-                );
+                let node = &mut self.nodes[index];
+                node.seeded = false;
+                let replayed = node.replayed(at);
+                node.recorded(at);
+                if !replayed {
+                    self.record(
+                        at,
+                        source,
+                        Severity::Warn,
+                        format!("{label} fell behind by {dropped} changes"),
+                    );
+                }
             }
         }
     }
@@ -402,6 +428,13 @@ impl App {
             VerifierInput::Stream(StreamInput::Event(Stamped { at, event })) => {
                 self.verifier_event(at, event);
             }
+
+            VerifierInput::Stream(StreamInput::Unreadable(error)) => self.record(
+                now,
+                Source::Verifier,
+                Severity::Warn,
+                format!("verifier stream skipped an unreadable event: {error}"),
+            ),
 
             VerifierInput::Status(status) => self.verifier.status = Some(status),
         }
@@ -525,6 +558,8 @@ pub struct NodeSource {
     pub probes: Option<ProbeReport>,
     pub stale_since: Option<u64>,
     seeded: bool,
+    recorded_through: Option<u64>,
+    replayed_through: Option<u64>,
 }
 
 impl NodeSource {
@@ -547,6 +582,8 @@ impl NodeSource {
             probes: None,
             stale_since: None,
             seeded: false,
+            recorded_through: None,
+            replayed_through: None,
         }
     }
 
@@ -567,6 +604,16 @@ impl NodeSource {
         self.snapshot = None;
         self.settlement = None;
         self.seeded = false;
+        self.recorded_through = None;
+        self.replayed_through = None;
+    }
+
+    fn replayed(&self, at: u64) -> bool {
+        self.replayed_through.is_some_and(|through| at <= through)
+    }
+
+    fn recorded(&mut self, at: u64) {
+        self.recorded_through = Some(self.recorded_through.map_or(at, |through| through.max(at)));
     }
 }
 
@@ -1008,6 +1055,80 @@ mod tests {
             texts(&app),
             vec!["node1 settled false at v1", "node1 settled true at v1"]
         );
+    }
+
+    /// A recovery interrupted before its last item is repeated in full: what the first attempt
+    /// showed is not shown again, and what neither showed is.
+    #[test]
+    fn a_repeated_recovery_shows_each_entry_once() {
+        let history = [
+            (3, InspectEvent::Settled(settlement(1, false))),
+            (4, InspectEvent::Settled(settlement(1, true))),
+            (5, InspectEvent::Gap { dropped: 2 }),
+            (
+                6,
+                InspectEvent::State(state(2, vec![up(7001), down(7002)], vec![])),
+            ),
+            (7, InspectEvent::Settled(settlement(2, true))),
+        ];
+        let mut app = App::new(&config());
+        node1(&mut app);
+        for (at, event) in history.clone() {
+            inspect(&mut app, 0, at, event);
+        }
+        let shown = texts(&app).len();
+
+        for _ in 0..2 {
+            inspect(&mut app, 0, 8, inspect_hello(100, false));
+            for (at, event) in history.clone() {
+                inspect(&mut app, 0, at, event);
+            }
+        }
+        inspect(&mut app, 0, 9, InspectEvent::Settled(settlement(2, false)));
+
+        assert_eq!(
+            texts(&app)[..shown],
+            [
+                "node1 settled false at v1",
+                "node1 settled true at v1",
+                "node1 fell behind by 2 changes",
+                "node1 settled true at v2",
+            ]
+        );
+        assert_eq!(
+            texts(&app)[shown..],
+            [
+                "node1 history lost, replaying what is retained",
+                "node1 history lost, replaying what is retained",
+                "node1 settled false at v2",
+            ]
+        );
+    }
+
+    /// The state after an unreadable one is a new baseline, not a diff across the one skipped.
+    #[test]
+    fn an_unreadable_inspect_event_reseeds_without_transitions() {
+        let mut app = App::new(&config());
+        node1(&mut app);
+        app.apply(
+            Input::Node(
+                0,
+                NodeInput::Inspect(StreamInput::Unreadable("bad".to_string())),
+            ),
+            NOW,
+        );
+        inspect(
+            &mut app,
+            0,
+            4,
+            InspectEvent::State(state(3, vec![up(7001), down(7002)], vec![])),
+        );
+
+        assert_eq!(
+            texts(&app),
+            vec!["node1 inspect stream skipped an unreadable event: bad"]
+        );
+        assert_eq!(app.cell(0, addr(7002)), Cell::Down);
     }
 
     #[test]
